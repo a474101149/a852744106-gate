@@ -1,9 +1,8 @@
 name: VPN Gate Node Check
 
 on:
-  # 定时检测: 每 30 分钟一次 (节点轮换周期)
-  schedule:
-    - cron: "*/30 * * * *"
+  # 触发改由 ming 自己的 VPS 定时 (cron 每 30 分钟调用 workflow_dispatch API, 2026-11-16 改);
+  # GitHub 自带 schedule 从未可靠触发, 故移除, 避免双触发。
   workflow_dispatch:
 
 permissions:
