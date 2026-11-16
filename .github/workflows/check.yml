@@ -1,0 +1,93 @@
+name: VPN Gate Node Check
+
+on:
+  # 定时检测: 每 30 分钟一次 (节点轮换周期)
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: gate-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Get VPN Gate nodes + check via Cloudflare Worker + build page
+        run: python vpngate.py
+        env:
+          # 个人配置全部走 Secrets / Variables, 不写进代码
+          WORKER_CHECK_URL: ${{ secrets.CHECK_WORKER_URL }}
+          UUID: ${{ secrets.EDT_UUID }}
+          DOMAIN: ${{ vars.EDT_DOMAIN }}
+          EDGE_HOSTS: ${{ vars.EDGE_HOSTS }}
+          HOSTS_URL: ${{ vars.HOSTS_URL }}
+          NODES_URL: ${{ vars.NODES_URL }}
+          CHAIN_URL: ${{ vars.CHAIN_URL }}
+          SUB_URL: ${{ vars.SUB_URL }}
+          CHECK_CONCURRENCY: "32"
+          CHECK_TIMEOUT: "90"
+
+      - name: Keep subscription out of the public site
+        run: |
+          mkdir -p private-out
+          if [ -f public/sub.txt ]; then mv public/sub.txt private-out/sub.txt; fi
+
+      - name: Upload subscription as private artifact (login required to download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sub
+          path: private-out/
+          retention-days: 7
+
+      - name: Ensure GitHub Pages is enabled (one-time auto setup)
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/pages")
+          echo "Pages API status: $code"
+          if [ "$code" = "404" ]; then
+            echo "首次运行: 启用 GitHub Pages (source = GitHub Actions)"
+            curl -sS -X PUT \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"build_type":"workflow","source":{"branches":["main"],"path":"/public"}}' \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/pages"
+            echo
+            sleep 10
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'public'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Show site URL
+        run: 'echo "site: https://a474101149.github.io/a852744106-gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
