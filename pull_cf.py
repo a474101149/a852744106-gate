@@ -2,7 +2,7 @@
 # CF 分国优选/中转名单拉取器 (ming 自用)
 # 每轮: 拉公开分国名单 -> 按国家去重 -> TCP 测活 -> 生成 nodes.txt + data.json
 # 只用标准库, 无需 pip。测活只代表"从运行这台机器出发能连通", 不代表客户端一定快。
-import concurrent.futures, json, re, socket, sys, time, urllib.request
+import concurrent.futures, ipaddress, json, re, socket, sys, time, urllib.request
 from datetime import datetime, timezone
 
 UA = {"User-Agent": "cfpull/1.0"}
@@ -15,6 +15,25 @@ COUNTRIES = {  # code -> 中文名
 }
 # 固定占位 IP, 每份名单第一行都是它, 与国家无关, 剔除
 SKIP_HOSTS = {"162.159.198.1"}
+
+# 稳定模式 (ming 2026-11-17 要求稳定优先): 只保留 Cloudflare 官方任播 IP 段 + 443 端口。
+# 官方 IP 不会下线, 稳定性最高; 代价: 靠别人中转机落国的条目 (多为韩国/英国, 非 443 怪端口) 会被剔除,
+# 国家标注变为"该 IP 的惯常落点", 不保证每次都落该国。
+STABLE_ONLY = True
+CF_NETS = [ipaddress.ip_network(c) for c in (
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22")]
+
+def is_stable(host, port):
+    if port != 443:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # 域名条目不进稳定池
+    return any(ip in n for n in CF_NETS)
 
 # (国家, 来源名, URL) —— 顺序即优先级: 联通向实测源在前
 SOURCES = [
@@ -86,7 +105,8 @@ def main():
         except Exception as e:
             errors.append(f"{name}: {e}")
 
-    items = [(cc, h, p, s) for (cc, h, p), s in pool.items()]
+    items = [(cc, h, p, s) for (cc, h, p), s in pool.items()
+             if not STABLE_ONLY or is_stable(h, p)]
     alive = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=60) as ex:
         for r in ex.map(tcp_test, items):
@@ -97,8 +117,17 @@ def main():
     for cc, h, p, s, ms in alive:
         by_cc[cc].append((ms, h, p, s))
     lines, summary = [], {}
+    seen_hp = set()  # 同一 IP:端口 只归一个国家 (任播 IP 被多份名单标成不同国家时, 按 JP>KR>SG>US>GB 取先)
     for cc in ["JP", "KR", "SG", "US", "GB"]:
-        lst = sorted(by_cc[cc])[:MAX_PER_COUNTRY]
+        lst = []
+        for entry in sorted(by_cc[cc]):
+            hp = (entry[1], entry[2])
+            if hp in seen_hp:
+                continue
+            seen_hp.add(hp)
+            lst.append(entry)
+            if len(lst) >= MAX_PER_COUNTRY:
+                break
         summary[cc] = {"candidates": sum(1 for i in items if i[0] == cc),
                        "alive": len(by_cc[cc]), "kept": len(lst)}
         for i, (ms, h, p, s) in enumerate(lst, 1):
