@@ -75,6 +75,8 @@ EDT_FINGERPRINT = os.environ.get("EDT_FINGERPRINT", "chrome")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
+MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "3500"))        # 延迟门槛: responseTime 超过此值(ms)的成功节点也丢弃 (国内用必超时-1)
+RECHECK_ENABLED = os.environ.get("RECHECK", "1").strip().lower() not in ("0", "false", "no")  # 发布前二次复检: 只发布两次都过的节点
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取数据源超时
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
@@ -383,6 +385,50 @@ def check_all(nodes, session):
     return results
 
 
+def apply_latency_filter(results):
+    """延迟门槛: success 但 responseTime > MAX_LATENCY_MS 的改为 failed。返回丢弃数。"""
+    dropped = 0
+    for r in results:
+        if r.get("success"):
+            lat = r.get("latency_ms")
+            if isinstance(lat, (int, float)) and lat > MAX_LATENCY_MS:
+                r["success"] = False
+                r["status"] = "failed"
+                r["error"] = f"slow-filter: latency {int(lat)}ms > {MAX_LATENCY_MS}ms"
+                dropped += 1
+    return dropped
+
+
+def recheck_survivors(results, session):
+    """发布前二次复检: 只保留两次都通过的节点。
+    二次失败中疑似被检测目标限流(429)或 Worker 异常的, 隔 5 秒错峰重试一次再判死,
+    避免 iplocate.io 限流误杀好节点。返回 (最终results, 二次通过数, 二次淘汰数)。"""
+    survivors = [r for r in results if r.get("success")]
+    if not survivors:
+        return results, 0, 0
+    second = check_all([{"host": r["host"], "port": r["port"], "country": r.get("country"), "country_code": r.get("country_code"), "ip": r.get("ip")} for r in survivors], session)
+    # 429 / Worker 异常的假阴性: 错峰重试一次
+    retry_targets = [r for r in second if not r.get("success") and (r.get("worker_error") or "429" in str(r.get("error") or ""))]
+    if retry_targets:
+        time.sleep(5)
+        retried = check_all([{"host": r["host"], "port": r["port"], "country": r.get("country"), "country_code": r.get("country_code"), "ip": r.get("ip")} for r in retry_targets], session)
+        retried_map = {(r["host"], r["port"]): r for r in retried}
+        second = [retried_map.get((r["host"], r["port"]), r) if not r.get("success") else r for r in second]
+    apply_latency_filter(second)
+    second_map = {(r["host"], r["port"]): r for r in second}
+    final = []
+    passed = 0
+    for r in results:
+        if r.get("success"):
+            s = second_map.get((r["host"], r["port"]), r)
+            final.append(s)
+            if s.get("success"):
+                passed += 1
+        else:
+            final.append(r)
+    return final, passed, len(survivors) - passed
+
+
 # ---------------------------------------------------------------------------
 # 第 4 步: 生成网页数据与导出文件
 # ---------------------------------------------------------------------------
@@ -533,6 +579,12 @@ def build_hosts_text(data):
             entry = edge[idx % len(edge)]
             idx += 1
             lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+    # 稳定直连兜底: 无 $sstp 链式后缀 = 普通 edgetunnel 节点, 出口为 Cloudflare,
+    # 不随 VPN Gate 志愿节点死亡; 链式全灭时订阅里至少还有这几条能用。
+    lines.append("")
+    lines.append("# ---- 稳定-直连 · 兜底 (无链式, 出口 CF) ----")
+    for i, entry in enumerate(edge, 1):
+        lines.append(f"{entry}#稳定-直连-{i:02d}")
     return "\n".join(lines) + "\n"
 
 
@@ -616,6 +668,18 @@ def build_sub_text(data):
                 f"&path={path}&encryption=none#{quote(name, safe='')}"
             )
             lines.append(link)
+    # 稳定直连兜底 (与 nodes.txt 同步): 普通节点 path=/, 入口即 EDGE_HOSTS, 出口 CF
+    if EDT_UUID and EDT_DOMAIN:
+        for i, entry in enumerate(EDGE_HOSTS, 1):
+            ehost, _, eport = entry.rpartition(":")
+            ehost = ehost or entry
+            eport = eport if eport.isdigit() else "443"
+            name = f"稳定-直连-{i:02d}"
+            lines.append(
+                f"vless://{EDT_UUID}@{ehost}:{eport}?security=tls&type=ws"
+                f"&host={EDT_DOMAIN}&fp={EDT_FINGERPRINT}&sni={EDT_DOMAIN}"
+                f"&path=%2F&encryption=none#{quote(name, safe='')}"
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -826,6 +890,16 @@ def main():
     t0 = time.time()
     results = check_all(uniq, session)
     elapsed = time.time() - t0
+
+    # 延迟门槛: 慢节点从国内用必超时, 提前砍掉
+    dropped_slow = apply_latency_filter(results)
+    if dropped_slow:
+        log("CLOUDFLARE WORKER", f"延迟门槛砍掉: {dropped_slow} (>{MAX_LATENCY_MS}ms)")
+
+    # 发布前二次复检: 只发布两次都过的, 砍掉"生成时活、用时已死"的那批
+    if RECHECK_ENABLED:
+        results, recheck_passed, recheck_dropped = recheck_survivors(results, session)
+        log("CLOUDFLARE WORKER", f"二次复检通过: {recheck_passed}, 淘汰: {recheck_dropped}")
 
     success = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
