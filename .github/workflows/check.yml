@@ -45,6 +45,11 @@ jobs:
           CHECK_CONCURRENCY: "32"
           CHECK_TIMEOUT: "90"
 
+      - name: Pull CF country preferred/relay lists (ming 2026-11-17 add-on, failure must not break gate)
+        run: |
+          mkdir -p public/cf
+          python3 pull_cf.py public/cf || echo "cf pull failed, continuing without it"
+
       - name: Keep subscription out of the public site
         run: |
           mkdir -p private-out
