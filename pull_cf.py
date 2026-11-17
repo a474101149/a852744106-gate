@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
-# CF 分国优选/中转名单拉取器 (ming 自用)
-# 每轮: 拉公开分国名单 -> 按国家去重 -> TCP 测活 -> 生成 nodes.txt + data.json
-# 只用标准库, 无需 pip。测活只代表"从运行这台机器出发能连通", 不代表客户端一定快。
-import concurrent.futures, ipaddress, json, re, socket, sys, time, urllib.request
+# CF 分国优选名单拉取器 v3 (ming 自用)
+# v3 关键修正 (2026-11-17 实测教训): 只测 TCP 连通没用 —— 大量名单 IP 对 ming 自己的域名
+# 返回 Cloudflare 1034 (Edge IP Restricted), 客户端连上也是 -1。名单作者是用他们自己的
+# 域名/speed.cloudflare.com 测的, 对别人的域名不作数。
+# 所以本版测活 = 拿 ming 自己的域名做 SNI+Host 实测 HTTPS, 返回 200 (Worker 的 hello) 才留。
+# 另加"通用池": 从对所有域名普遍可用的 CF 任播段随机抽 IP 同样实测, 落点随客户端网络而定,
+# ming 可在 V2RayN 里按延迟挑 (低延迟 ≈ 近落点)。
+import concurrent.futures, ipaddress, json, random, re, socket, ssl, sys, time, urllib.request
 from datetime import datetime, timezone
 
-UA = {"User-Agent": "cfpull/1.0"}
+UA = {"User-Agent": "cfpull/3.0"}
 TIMEOUT_FETCH = 20
-TIMEOUT_TCP = 3
+TIMEOUT_PROBE = 6
 MAX_PER_COUNTRY = 15
+MAX_GENERAL = 30
+ZONE_HOST = "cfnew.474101149.xyz"  # 实测目标: ming 自己的 Worker 域名
 
 COUNTRIES = {  # code -> 中文名
-    "JP": "日本", "KR": "韩国", "SG": "新加坡", "US": "美国", "GB": "英国",
+    "JP": "日本", "KR": "韩国", "SG": "新加坡", "US": "美国", "GB": "英国", "GL": "通用",
 }
-# 固定占位 IP, 每份名单第一行都是它, 与国家无关, 剔除
-SKIP_HOSTS = {"162.159.198.1"}
+SKIP_HOSTS = {"162.159.198.1"}  # 固定占位 IP, 与国家无关
 
-# 稳定模式 (ming 2026-11-17 要求稳定优先): 只保留 Cloudflare 官方任播 IP 段 + 443 端口。
-# 官方 IP 不会下线, 稳定性最高; 代价: 靠别人中转机落国的条目 (多为韩国/英国, 非 443 怪端口) 会被剔除,
-# 国家标注变为"该 IP 的惯常落点", 不保证每次都落该国。
-STABLE_ONLY = True
 CF_NETS = [ipaddress.ip_network(c) for c in (
     "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
     "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
@@ -32,10 +33,9 @@ def is_stable(host, port):
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        return False  # 域名条目不进稳定池
+        return False
     return any(ip in n for n in CF_NETS)
 
-# (国家, 来源名, URL) —— 顺序即优先级: 联通向实测源在前
 SOURCES = [
     ("JP", "tiancheng", "https://edt-aio-nav.pages.dev/tiancheng/jp.txt"),
     ("KR", "tiancheng", "https://edt-aio-nav.pages.dev/tiancheng/kr.txt"),
@@ -45,11 +45,14 @@ SOURCES = [
     ("SG", "gslege", "https://edt-aio-nav.pages.dev/gslege/SG.txt"),
     ("US", "gslege", "https://edt-aio-nav.pages.dev/gslege/US.txt"),
 ]
-# JZ 源: 一份文件混多国, 国家写在备注里 (#JP / #KR ...), 联通向, 半小时更新
 JZ_FILES = [
     ("jz-best", "https://raw.githubusercontent.com/HandsomeMJZ/cfip/refs/heads/main/best_ips.txt"),
     ("jz-full", "https://raw.githubusercontent.com/HandsomeMJZ/cfip/refs/heads/main/full_ips.txt"),
 ]
+
+# 通用池抽样段 (对各域名普遍可用的任播段) 与每段抽样数
+GEN_POOL = [("104.16.0.0/13", 140), ("172.67.0.0/16", 50),
+            ("162.159.192.0/19", 30), ("103.31.4.0/22", 20)]
 
 HOSTPORT = re.compile(r"^([A-Za-z0-9.\-]+):(\d{2,5})\b")
 TAG = re.compile(r"#\s*(JP|KR|SG|US|GB|UK)\b")
@@ -78,18 +81,37 @@ def parse_lines(text, fixed_country=None):
         out.append((cc, host, port))
     return out
 
-def tcp_test(item):
+_CTX = ssl.create_default_context()
+
+def zone_probe(item):
+    """拿 ZONE_HOST 做 SNI/Host 实测: 返回 HTTP 200 才算这个 IP 真能给 ming 的域名当入口。"""
     cc, host, port, src = item
     t0 = time.time()
     try:
-        with socket.create_connection((host, port), timeout=TIMEOUT_TCP):
+        with socket.create_connection((host, port), timeout=TIMEOUT_PROBE) as raw:
+            with _CTX.wrap_socket(raw, server_hostname=ZONE_HOST) as s:
+                s.sendall(f"GET / HTTP/1.1\r\nHost: {ZONE_HOST}\r\nConnection: close\r\nUser-Agent: cfpull/3.0\r\n\r\n".encode())
+                data = s.recv(128)
+        if data.split(b"\r\n", 1)[0].split()[1:2] == [b"200"]:
             return (cc, host, port, src, round((time.time() - t0) * 1000))
     except Exception:
-        return None
+        pass
+    return None
+
+def gen_candidates():
+    # 固定种子: 每轮抽同一批候选, 存活集稳定, 避免订阅里的 IP 每 30 分钟全换一遍
+    rng = random.Random(20261117)
+    out = []
+    for cidr, n in GEN_POOL:
+        net = ipaddress.ip_network(cidr)
+        base, total = int(net.network_address), net.num_addresses
+        for off in rng.sample(range(total), min(n, total)):
+            out.append(("GL", str(ipaddress.ip_address(base + off)), 443))
+    return out
 
 def main():
     out_dir = sys.argv[1] if len(sys.argv) > 1 else "."
-    pool = {}   # (cc, host, port) -> source (先到先得 = 高优先级)
+    pool = {}
     errors = []
     for cc, name, url in SOURCES:
         try:
@@ -104,12 +126,13 @@ def main():
                     pool.setdefault((c2, h, p), name)
         except Exception as e:
             errors.append(f"{name}: {e}")
+    for c2, h, p in gen_candidates():
+        pool.setdefault((c2, h, p), "genpool")
 
-    items = [(cc, h, p, s) for (cc, h, p), s in pool.items()
-             if not STABLE_ONLY or is_stable(h, p)]
+    items = [(cc, h, p, s) for (cc, h, p), s in pool.items() if is_stable(h, p)]
     alive = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=60) as ex:
-        for r in ex.map(tcp_test, items):
+        for r in ex.map(zone_probe, items):
             if r:
                 alive.append(r)
 
@@ -117,8 +140,9 @@ def main():
     for cc, h, p, s, ms in alive:
         by_cc[cc].append((ms, h, p, s))
     lines, summary = [], {}
-    seen_hp = set()  # 同一 IP:端口 只归一个国家 (任播 IP 被多份名单标成不同国家时, 按 JP>KR>SG>US>GB 取先)
-    for cc in ["JP", "KR", "SG", "US", "GB"]:
+    seen_hp = set()
+    for cc in ["JP", "KR", "SG", "US", "GB", "GL"]:
+        cap = MAX_GENERAL if cc == "GL" else MAX_PER_COUNTRY
         lst = []
         for entry in sorted(by_cc[cc]):
             hp = (entry[1], entry[2])
@@ -126,7 +150,7 @@ def main():
                 continue
             seen_hp.add(hp)
             lst.append(entry)
-            if len(lst) >= MAX_PER_COUNTRY:
+            if len(lst) >= cap:
                 break
         summary[cc] = {"candidates": sum(1 for i in items if i[0] == cc),
                        "alive": len(by_cc[cc]), "kept": len(lst)}
